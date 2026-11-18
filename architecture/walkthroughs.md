@@ -1,110 +1,81 @@
 # Request walkthroughs
 
 Diagram: [`architecture-diagram.png`](architecture-diagram.png). I built it in the Cloud Architecture Lab.
-Region: **ap-south-1 (Mumbai)**, the closest AWS region to the university. Two Availability Zones: **AZ-a** and **AZ-b**.
 
-## Network layout
+The platform runs in **ap-south-1 (Mumbai)** across two Availability Zones, AZ-A and AZ-B.
 
-| Subnet | AZ-a | AZ-b | What lives there |
+## Network
+
+| Subnet | AZ-A | AZ-B | What runs there |
 |---|---|---|---|
-| Public | 10.0.0.0/19 | 10.0.32.0/19 | ALB nodes, NAT Gateway (one per AZ) |
-| Private app | 10.0.64.0/19 | 10.0.96.0/19 | ECS Fargate API tasks |
-| Private data | 10.0.128.0/19 | 10.0.160.0/19 | Aurora PostgreSQL writer / reader |
+| Public | 10.0.0.0/19 | 10.0.32.0/19 | Load balancer, NAT Gateway |
+| Private app | 10.0.64.0/19 | 10.0.96.0/19 | ECS Fargate API |
+| Private data | 10.0.128.0/19 | 10.0.160.0/19 | Aurora writer (AZ-A), Aurora reader (AZ-B) |
 
-Each subnet is a /19 with 8,187 usable addresses. Each Fargate task takes one IP, so that is plenty. It also matches how the Cloud Architecture Lab splits a /16 VPC into six equal subnets. The range 10.0.192.0/18 stays free for growth.
-
-The security groups form a chain. `ALB-SG` accepts 443 only from the CloudFront managed prefix list. `API-SG` accepts 8080 only from `ALB-SG`. `DB-SG` accepts 5432 only from `API-SG`. The database has no public IP and no route to the Internet Gateway.
-
----
+The VPC is 10.0.0.0/16. Only the load balancer is open to the internet. The API only accepts traffic from the load balancer, and the database only accepts traffic from the API.
 
 ## Walkthrough 1: a student opens an exam and answers autosave
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant B as Student browser
-    participant R53 as Route 53
-    participant CF as CloudFront + WAF
-    participant S3W as S3 (SPA)
-    participant COG as Cognito
-    participant ALB as ALB (2 AZs)
-    participant API as Fargate API (AZ-a or AZ-b)
-    participant DB as Aurora PostgreSQL
-    participant DDB as DynamoDB (autosave)
-    participant Q as SQS marking
-    participant L as Lambda auto-mark
+    participant S as Student
+    participant E as Route 53 + WAF + CloudFront
+    participant LB as Load balancer
+    participant API as ECS API
+    participant DB as Aurora
+    participant D as DynamoDB
 
-    B->>R53: exams.uni.edu ?
-    R53-->>B: CloudFront alias
-    B->>CF: GET / (HTTPS)
-    CF->>S3W: cache miss only (OAC)
-    CF-->>B: React app (cached at edge)
-    B->>COG: sign in (SRP)
-    COG-->>B: ID/access JWT, group = student
-    B->>CF: GET /api/v1/exams/123  (Bearer JWT)
-    CF->>ALB: WAF rules + rate limit passed
-    ALB->>API: healthy target in either AZ
-    API->>API: verify JWT signature, group = student, exam window open
-    API->>DB: SELECT exam, questions (no answer key)
-    API->>DDB: PutItem attempt {student, exam, startedAt, deadline}
-    API-->>B: questions + server deadline
+    S->>E: open the exam page
+    E->>LB: request passes WAF checks
+    LB->>API: sent to a healthy task in AZ-A or AZ-B
+    API->>DB: read the exam questions
+    API->>D: save the start time and deadline
+    API-->>S: questions + deadline
     loop every 30 seconds
-        B->>CF: PUT /api/v1/attempts/123/answers {seq, answers}
-        CF->>ALB: forward
-        ALB->>API: forward
-        API->>DDB: conditional UpdateItem (only if seq is newer, before deadline)
-        API-->>B: 200 saved at 10:31:30
+        S->>API: send current answers
+        API->>D: save answers
     end
-    B->>CF: POST /api/v1/attempts/123/submit
-    API->>DDB: mark attempt SUBMITTED
-    API->>Q: SendMessage {attemptId}
-    API-->>B: 202 submitted
-    Q->>L: batch of messages
-    L->>DDB: read final answers + MCQ key copied at exam start
-    L->>DDB: write mcqScore, status MARKED_MCQ (short answers wait for tutor)
 ```
 
-Step by step:
-1. **DNS and edge.** Route 53 points the domain to CloudFront. WAF checks the AWS managed rules and a per-IP rate limit. CloudFront serves the SPA from its cache. On a miss, it reads the private S3 bucket through Origin Access Control.
-2. **Sign-in.** Cognito signs the student in and issues a JWT. Its `cognito:groups` claim is `student`.
-3. **Open exam.** `GET /api/v1/exams/123` goes CloudFront → ALB → any healthy Fargate task in AZ-a or AZ-b. The API checks the JWT, checks that the student is enrolled and that the exam window is open, then reads the exam from Aurora without the answer key. It records the attempt start in DynamoDB, together with a copy of the MCQ answer key. That way marking never has to query Aurora at peak time. The **server** sets the deadline, so nobody can cheat the timer from the browser.
-4. **Autosave every 30 s.** The browser sends the current answers with a sequence number that keeps going up. The API runs a conditional `UpdateItem` in DynamoDB, so an older or late save can never overwrite a newer one. The browser also keeps a copy in local storage, so a network blip loses nothing.
-5. **Submit and auto-mark.** On submit, or when the timer runs out, the API sets the status to `SUBMITTED` and puts a message on SQS. A Lambda function marks the MCQs against the stored key and writes the score on the attempt. When the tutor finishes marking the short answers, the API saves the final result to the `results` table in Aurora. A message that fails 3 times goes to a dead-letter queue.
+1. The student is already signed in with Cognito, so every request carries a login token.
+2. Route 53 sends the request to CloudFront. AWS WAF checks it first and blocks attacks and floods.
+3. CloudFront passes the API request through the Internet Gateway to the load balancer.
+4. The load balancer sends it to a healthy ECS task in either AZ.
+5. The API checks the token and the exam time, then reads the questions from Aurora.
+6. The API saves the start time and deadline in DynamoDB. The server keeps the deadline, so the student can't change the timer.
+7. Every 30 seconds the browser sends the answers, and the API saves them in DynamoDB. A newer save always replaces an older one.
+
+When the student submits, the API puts a job on the SQS marking queue and a Lambda marks the MCQs.
 
 ## Walkthrough 2: a student uploads a 40 MB assignment and the tutor is notified
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant B as Student browser
-    participant CF as CloudFront + WAF
-    participant API as Fargate API
-    participant S3 as S3 assignments (SSE-KMS)
+    participant S as Student
+    participant API as ECS API
+    participant B as S3 assignments
     participant EB as EventBridge
-    participant LU as Lambda upload processor
-    participant DB as Aurora
-    participant SNS as SNS tutor-notifications
-    participant T as Tutor inbox
+    participant L as Lambda
+    participant N as SNS
+    participant T as Tutor
 
-    B->>CF: POST /api/v1/assignments/77/uploads {name, type, size=40MB}
-    CF->>API: via ALB
-    API->>API: JWT ok, before due date, type PDF/ZIP, size <= 50 MB
-    API-->>B: presigned PUT URL (expires 15 min, fixed key + content-type)
-    B->>S3: PUT 40 MB directly (HTTPS, never touches the API)
-    S3->>S3: encrypt with KMS key, keep version
-    S3->>EB: Object Created event
-    EB->>LU: rule matches prefix submissions/
-    LU->>S3: HEAD object (check size, type)
-    LU->>DB: INSERT submission row via RDS Data API
-    LU->>SNS: Publish "New submission from Student X"
-    SNS->>T: email (tutor's address is subscribed to the topic)
+    S->>API: ask to upload report.pdf (40 MB)
+    API-->>S: presigned upload link (15 min)
+    S->>B: upload the file directly
+    B->>EB: "new file" event
+    EB->>L: start the upload Lambda
+    L->>N: publish "new submission"
+    N->>T: email
 ```
 
-Step by step:
-1. **Ask for an upload slot.** The browser calls `POST /api/v1/assignments/77/uploads`. The API checks the JWT, the due date, the file type (PDF or ZIP) and the size (≤ 50 MB). It returns a **presigned S3 PUT URL**. The URL works for 15 minutes and only for one object key and content type.
-2. **Direct upload.** The browser PUTs the 40 MB file straight to S3 over HTTPS. The file never passes through CloudFront, the ALB or the containers, so big uploads can't tie up the API during exam week.
-3. **Stored safely.** S3 encrypts the object with the KMS key and keeps every version. Lifecycle rules move it to cheaper storage over time and delete it after 5 years.
-4. **Event-driven processing.** S3 sends an *Object Created* event to EventBridge. A rule triggers the upload-processor Lambda. The Lambda checks the object and writes a submission row in Aurora.
-5. **Tutor notified.** The Lambda publishes a message to the **SNS topic `tutor-notifications`**. The tutor's email address subscribes to the topic, so SNS emails them straight away. SNS retries delivery itself, so this small, one-per-upload message needs no extra queue.
+1. The student asks the API for an upload link. The API checks it is a PDF or ZIP, under 50 MB, and before the due date.
+2. The API gives back a presigned S3 link that works for 15 minutes.
+3. The browser uploads the 40 MB file straight to S3. It never goes through the API, so big uploads don't slow the exam system down.
+4. S3 encrypts the file and keeps it for 5 years.
+5. S3 sends a "new file" event to EventBridge, which starts a Lambda.
+6. The Lambda checks the file, saves the submission record and publishes a message to SNS.
+7. SNS emails the tutor.
 
-**Results released (the other email feature).** When a tutor releases results, the API puts one message per student on the **SQS results-email queue**. A Lambda sends each email through **Amazon SES**. I use SQS here because one release can create hundreds of emails at once. The queue absorbs the burst and retries any failures through a DLQ.
+Results emails work differently. When a tutor releases results, the API puts one message per student on an SQS queue, and a Lambda sends each email through Amazon SES.

@@ -1,4 +1,4 @@
-# DSO303 Assignment 2 – Online Exam Platform on AWS
+# DSO303 Assignment 2: Online Exam Platform on AWS
 
 This repo has my architecture for moving a university's exams and assignment submissions online (8,000 students, about 400 staff).
 
@@ -27,37 +27,21 @@ More detail:
 
 ## Deploy
 
-You need an AWS account, the AWS CLI and a verified sender email in SES.
+All the infrastructure is in the `infra/` folder as CloudFormation templates. You can deploy it from the AWS Console.
 
-1. Create the GitHub deploy role:
-   ```bash
-   aws cloudformation deploy --region ap-south-1 --stack-name exam-github-oidc \
-     --template-file infra/github-oidc.yaml --capabilities CAPABILITY_NAMED_IAM \
-     --parameter-overrides GitHubRepo=<owner>/<repo>
-   aws cloudformation describe-stacks --region ap-south-1 --stack-name exam-github-oidc \
-     --query "Stacks[0].Outputs[0].OutputValue" --output text
-   ```
-2. In the GitHub repo settings, add the secrets `AWS_DEPLOY_ROLE_ARN` (the ARN from step 1) and `ORIGIN_VERIFY_SECRET` (any random string), the variables `SENDER_EMAIL` and `ALARM_EMAIL`, and an environment called `production`.
-3. Push to `main`. The workflow in `.github/workflows/deploy.yml` builds and deploys everything. Every push after that redeploys automatically.
-4. Run `app/schema.sql` once in the RDS Query Editor.
-5. Add users in Cognito and put them in the `student`, `tutor` or `admin` group.
+1. Sign in to the AWS Console and open **CloudFormation**.
+2. Switch the region to **us-east-1**. Click **Create stack**, upload `infra/waf.yaml` and create it. When it finishes, copy the `WebAclArn` from the **Outputs** tab.
+3. Switch the region to **ap-south-1**. Click **Create stack** and upload `infra/main.yaml`.
+4. Fill in the parameters: paste the `WebAclArn`, type any long random text for `OriginVerifySecret`, and enter your email for `SenderEmail` and `AlarmEmail`.
+5. Tick the box that allows CloudFormation to create IAM roles, then create the stack. It takes about 20–30 minutes.
+6. When it finishes, open the `AppUrl` link from the **Outputs** tab.
+
+**Automatic deploy (CI/CD):** the workflow in `.github/workflows/deploy.yml` does the same steps on every push to `main`. It only deploys after you connect an AWS account to the repo (using `infra/github-oidc.yaml`) and set the repo variable `DEPLOY_ENABLED` to `true`. Without that, it only checks the code.
 
 ## Tear down
 
-The databases and buckets are protected so they aren't deleted by accident. Turn that off first, then delete the stacks:
-
-```bash
-REGION=ap-south-1
-# empty the buckets (repeat for the -web- and -trail- buckets)
-aws s3api delete-objects --bucket exam-prod-assignments-<account-id> \
-  --delete "$(aws s3api list-object-versions --bucket exam-prod-assignments-<account-id> \
-  --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' --output json)"
-# turn off deletion protection
-aws rds modify-db-cluster --region $REGION --db-cluster-identifier <cluster-id> --no-deletion-protection --apply-immediately
-aws dynamodb update-table --region $REGION --table-name exam-prod-attempts --no-deletion-protection-enabled
-# delete the stacks
-aws cloudformation delete-stack --region $REGION --stack-name exam-prod
-aws cloudformation delete-stack --region us-east-1 --stack-name exam-prod-waf
-aws cloudformation delete-stack --region $REGION --stack-name exam-github-oidc
-```
-
+1. Open **S3** and empty the three `exam-prod-...` buckets.
+2. Open **RDS**, select the Aurora cluster, click **Modify** and turn off **Deletion protection**.
+3. Open **DynamoDB**, select the `exam-prod-attempts` table and turn off **Deletion protection**.
+4. Open **CloudFormation** in ap-south-1 and delete the `main.yaml` stack. Then delete the `waf.yaml` stack in us-east-1.
+5. Some things are kept on purpose so data isn't lost by accident: the KMS key, the S3 buckets, the DynamoDB table, the backups and a final Aurora snapshot. Delete them by hand if you only deployed for testing.

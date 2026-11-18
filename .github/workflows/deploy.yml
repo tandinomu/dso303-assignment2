@@ -32,7 +32,7 @@ jobs:
 
   deploy:
     needs: validate
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
     runs-on: ubuntu-latest
     environment: production
     steps:
