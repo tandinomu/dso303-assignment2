@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>University Online Exams</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; color: #1f2937; }
+    .card { border: 1px solid #e5e7eb; border-radius: 10px; padding: 1rem 1.25rem; margin: 1rem 0; }
+    #status { font-size: .9rem; color: #047857; }
+    button { padding: .5rem 1rem; border-radius: 6px; border: 0; background: #1d4ed8; color: #fff; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h1>Online Exams &amp; Assignments</h1>
+  <p>Demo client for the two walkthroughs. In production this is the built React app; sign-in uses Amazon Cognito.</p>
+
+  <div class="card">
+    <h2>Exam</h2>
+    <label>Exam ID <input id="examId" value="DSO303-final" /></label>
+    <button onclick="openExam()">Open exam</button>
+    <p id="timer"></p>
+    <textarea id="answer" rows="6" style="width:100%" placeholder="Your answer..."></textarea>
+    <p id="status"></p>
+    <button onclick="submitExam()">Submit</button>
+  </div>
+
+  <div class="card">
+    <h2>Assignment upload (PDF or ZIP, max 50 MB)</h2>
+    <label>Assignment ID <input id="assignmentId" value="A2" /></label>
+    <input type="file" id="file" accept=".pdf,.zip" />
+    <button onclick="upload()">Upload</button>
+    <p id="uploadStatus"></p>
+  </div>
+
+<script>
+  // Access token from Cognito Hosted UI / Amplify Auth would be stored here after sign-in.
+  const token = () => sessionStorage.getItem("accessToken") || "";
+  const api = (path, opts = {}) => fetch(path, { ...opts,
+    headers: { "Content-Type": "application/json", Authorization: "Bearer " + token(), ...(opts.headers || {}) } });
+
+  let attemptId, seq = 0, timer;
+
+  async function openExam() {
+    const r = await api(`/api/v1/exams/${examId.value}`);
+    if (!r.ok) return (status.textContent = "Cannot open exam: " + r.status);
+    const data = await r.json();
+    attemptId = data.attemptId;
+    answer.value = localStorage.getItem(attemptId) || data.answers?.q1 || "";
+    clearInterval(timer);
+    timer = setInterval(autosave, 30000);          // autosave every 30 seconds
+    setInterval(() => {
+      const left = Math.max(0, data.deadline - Date.now());
+      document.getElementById("timer").textContent = "Time left: " + Math.ceil(left / 60000) + " min";
+      if (left === 0) submitExam();
+    }, 1000);
+  }
+
+  async function autosave() {
+    localStorage.setItem(attemptId, answer.value);  // local copy survives network blips
+    const r = await api(`/api/v1/attempts/${encodeURIComponent(attemptId)}/answers`, {
+      method: "PUT", body: JSON.stringify({ seq: ++seq, answers: { q1: answer.value } }) });
+    status.textContent = r.ok ? "Saved " + new Date().toLocaleTimeString() : "Save failed - will retry";
+  }
+
+  async function submitExam() {
+    clearInterval(timer);
+    await autosave();
+    const r = await api(`/api/v1/attempts/${encodeURIComponent(attemptId)}/submit`, { method: "POST" });
+    status.textContent = r.ok ? "Submitted - MCQs are being marked" : "Submit failed";
+  }
+
+  async function upload() {
+    const f = file.files[0];
+    if (!f) return;
+    const r = await api(`/api/v1/assignments/${assignmentId.value}/uploads`, { method: "POST",
+      body: JSON.stringify({ fileName: f.name, contentType: f.type, size: f.size }) });
+    if (!r.ok) return (uploadStatus.textContent = "Rejected: " + (await r.text()));
+    const { uploadUrl } = await r.json();
+    uploadStatus.textContent = "Uploading directly to S3...";
+    const put = await fetch(uploadUrl, { method: "PUT", headers: { "Content-Type": f.type }, body: f });
+    uploadStatus.textContent = put.ok ? "Uploaded. Your tutor has been notified." : "Upload failed";
+  }
+</script>
+</body>
+</html>

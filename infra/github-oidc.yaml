@@ -1,0 +1,48 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  One-time bootstrap. Lets GitHub Actions in ONE repository (main branch only) assume a deploy
+  role with short-lived OIDC credentials, so no AWS access keys are stored in GitHub.
+
+Parameters:
+  GitHubRepo:
+    Type: String
+    Description: owner/repo, e.g. jdoe/dso303-exam-platform
+  CreateProvider:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: Set false if the account already has the token.actions.githubusercontent.com provider.
+
+Conditions:
+  MakeProvider: !Equals [!Ref CreateProvider, "true"]
+
+Resources:
+  GitHubProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: MakeProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: exam-github-deploy
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubRepo}:ref:refs/heads/main
+      # CloudFormation creates IAM roles, VPCs, databases etc., so the deploy role needs broad rights.
+      # In a real university account this would be narrowed with a permissions boundary.
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/AdministratorAccess]
+
+Outputs:
+  DeployRoleArn:
+    Value: !GetAtt DeployRole.Arn

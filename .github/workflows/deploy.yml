@@ -1,0 +1,84 @@
+# CI/CD: every push to main validates, builds and redeploys the whole platform from code.
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # OIDC - no stored AWS keys
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1
+  STACK: exam-prod
+  WAF_STACK: exam-prod-waf
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install cfn-lint
+      - run: cfn-lint infra/*.yaml
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+      - run: cd app/api && npm install && npm test
+
+  deploy:
+    needs: validate
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy WAF (us-east-1, required for CloudFront)
+        run: |
+          aws cloudformation deploy --region us-east-1 --stack-name $WAF_STACK \
+            --template-file infra/waf.yaml --no-fail-on-empty-changeset
+          echo "WAF_ARN=$(aws cloudformation describe-stacks --region us-east-1 --stack-name $WAF_STACK \
+            --query "Stacks[0].Outputs[?OutputKey=='WebAclArn'].OutputValue" --output text)" >> $GITHUB_ENV
+
+      - name: First deploy creates the ECR repo with a placeholder image
+        run: |
+          if ! aws cloudformation describe-stacks --stack-name $STACK >/dev/null 2>&1; then
+            aws cloudformation deploy --stack-name $STACK --template-file infra/main.yaml \
+              --capabilities CAPABILITY_IAM \
+              --parameter-overrides WebAclArn=$WAF_ARN OriginVerifySecret=${{ secrets.ORIGIN_VERIFY_SECRET }} \
+                SenderEmail=${{ vars.SENDER_EMAIL }} AlarmEmail=${{ vars.ALARM_EMAIL }}
+          fi
+          echo "ECR=$(aws cloudformation describe-stacks --stack-name $STACK \
+            --query "Stacks[0].Outputs[?OutputKey=='EcrRepositoryUri'].OutputValue" --output text)" >> $GITHUB_ENV
+
+      - name: Build and push API image
+        run: |
+          aws ecr get-login-password | docker login --username AWS --password-stdin ${ECR%%/*}
+          docker build -t $ECR:${GITHUB_SHA::12} app/api
+          docker push $ECR:${GITHUB_SHA::12}
+
+      - name: Deploy platform stack with the new image (ECS rolls tasks, circuit breaker rolls back on failure)
+        run: |
+          aws cloudformation deploy --stack-name $STACK --template-file infra/main.yaml \
+            --capabilities CAPABILITY_IAM --no-fail-on-empty-changeset \
+            --parameter-overrides ApiImageUri=$ECR:${GITHUB_SHA::12} WebAclArn=$WAF_ARN \
+              OriginVerifySecret=${{ secrets.ORIGIN_VERIFY_SECRET }} \
+              SenderEmail=${{ vars.SENDER_EMAIL }} AlarmEmail=${{ vars.ALARM_EMAIL }}
+
+      - name: Publish frontend and invalidate CloudFront
+        run: |
+          out() { aws cloudformation describe-stacks --stack-name $STACK \
+            --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
+          aws s3 sync app/frontend s3://$(out FrontendBucketName) --delete
+          aws cloudfront create-invalidation --distribution-id $(out DistributionId) --paths "/*"
+          echo "Deployed: $(out AppUrl)"
